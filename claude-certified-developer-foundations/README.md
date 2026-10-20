@@ -6,4 +6,4 @@
   - [ ] Tool-use and Schema Design
   - [x] Streaming Responses
   - [x] Context Engineering
-  - [ ] Agent Construction
+  - [x] Agent Construction
