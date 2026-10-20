@@ -212,3 +212,150 @@ def build_session_history(prior_sessions, content_to_match):
       summary = load_session_summary(prior_sessions[-1]["id"]) # from external store
       return [{"role": "user", "content": f"Session context: {summary}"}]
   ```
+
+### Corrected Answer from Claude
+
+```python
+# Corrected version of my answer (third column of the three-way notes).
+# Legend:
+#   [AGREE w/ COURSE]  my answer was wrong, the course fix is right, applied as-is
+#   [MODIFIED COURSE]  the course fix needed a change or addition
+#   [KEPT MINE]        my original idea was right, kept (with a small note)
+
+MAX_STREAM_RETRIES = 3
+
+
+class StreamInterruptedError(Exception):
+    pass
+
+
+class MaxTokensError(Exception):
+    pass
+
+
+# --- TOOL DEFINITIONS ---
+# [AGREE w/ COURSE] I switched the lookup to "full name", but the property was
+# still called `id`, so the name and its description contradicted each other,
+# and two customers can share a full name. Back to ID-based lookup, with the
+# course's intent + exclusion wording.
+# [MODIFIED COURSE] The course description never says what the ID looks like or
+# what the tool returns. Added the UUID format on the `id` property and the
+# return fields, so the model does not invent an ID.
+tools = [
+  {
+    "name": "get_customer_data",
+    "description": (
+      "Use this to retrieve full account and contact details (name, age, "
+      "email, address) for a customer by customer ID. "
+      "Do not use this for order history or transaction records. "
+      "Do not call it if these details are already in the context."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Customer ID in UUID format, e.g. 123e4567-e89b-12d3-a456-426614174000. Never guess or construct one."
+        }
+      },
+      "required": ["id"]
+    }
+  }
+]
+
+
+# --- AGENT LOOP ---
+def run_agent(user_request, session_history):
+  messages = session_history + [{"role": "user", "content": user_request}]
+  while True:
+    # [MODIFIED COURSE] The course raises on an interrupted stream. My version
+    # looped silently with no cap. The fix: retry a bounded number of times,
+    # discard the partial turn each time, then raise.
+    for attempt in range(MAX_STREAM_RETRIES):
+      blocks = {}
+      stop_seen = False
+      try:
+        with client.messages.stream(
+            model=model, max_tokens=4096, tools=tools, messages=messages,
+            thinking={"type": "adaptive"}
+        ) as stream:
+          for event in stream:
+            if event.type == "content_block_start":
+              blocks[event.index] = init_block(event)
+            elif event.type == "content_block_delta":
+              apply_delta(blocks[event.index], event.delta)
+            elif event.type == "message_stop":
+              stop_seen = True
+      except Exception:
+        # A dropped connection raises mid-stream; treat it like an
+        # incomplete stream: nothing gets committed.
+        stop_seen = False
+
+      # [AGREE w/ COURSE] Gate the commit on stop_seen (it was set but never read).
+      if stop_seen:
+        break
+    else:
+      raise StreamInterruptedError(
+        "Stream never completed; partial turns were discarded, nothing committed."
+      )
+
+    # [AGREE w/ COURSE] Keep ALL blocks, including thinking with its signature.
+    # The API rejects a tool-use turn whose thinking block was stripped or edited.
+    assistant_content = assemble(blocks)
+    response = finalize(blocks)
+
+    # [MODIFIED COURSE] The course does not handle other stop reasons. I check
+    # BEFORE committing, so a truncated max_tokens turn (possibly a half-built
+    # tool_use) never enters history. [KEPT MINE] handling max_tokens at all.
+    # Changed: my version returned a string here while end_turn returned a
+    # response object (two return types). Now it raises, and callers get one
+    # return type.
+    if response.stop_reason == "max_tokens":
+      raise MaxTokensError("Reply hit max_tokens; trim context or raise the limit.")
+
+    messages.append({"role": "assistant", "content": assistant_content})
+
+    if response.stop_reason == "end_turn":
+      return response
+    if response.stop_reason != "tool_use":
+      raise RuntimeError(f"Unhandled stop_reason: {response.stop_reason}")
+
+    # [KEPT MINE] Context-layer fix: ONE user message holding ALL tool_result
+    # blocks for the assistant turn. The original appended one user message
+    # per tool call, which leaves earlier tool_use blocks unanswered.
+    # [MODIFIED COURSE] The course says this bug is "resolved once Bug 2 is
+    # fixed". Keeping the full assistant turn is required, but it does not fix
+    # the one-message-per-result structure, so the batching stays.
+    tool_result_blocks = []
+    for block in response.content:
+      if block.type == "tool_use":
+        result = execute_tool(block.name, block.input)
+        tool_result_blocks.append({
+          "type": "tool_result",
+          "tool_use_id": block.id,
+          "content": result,
+        })
+    messages.append({"role": "user", "content": tool_result_blocks})
+
+
+# --- MEMORY ---
+# [AGREE w/ COURSE] My version compared `word == content_to_match`, but
+# session["messages"] is a list of message dicts, not words, so it would
+# never match. It also returned raw slices from the middle of transcripts,
+# which can start with a tool_result whose tool_use is missing (the API
+# rejects that). Replaced with: store distilled summaries externally,
+# inject only a summary.
+# [MODIFIED COURSE] The course loads only the LAST session's summary, which
+# loses facts from older sessions unless each summary is cumulative. Note
+# added; also handles a missing summary.
+def build_session_history(prior_sessions):
+  if not prior_sessions:
+    return []
+  # Assumes each stored summary is cumulative (it carries forward the durable
+  # facts of earlier sessions). Otherwise, retrieve the relevant summaries
+  # for the current request instead of only the latest.
+  summary = load_session_summary(prior_sessions[-1]["id"])  # from external store
+  if not summary:
+    return []
+  return [{"role": "user", "content": f"Session context: {summary}"}]
+```
